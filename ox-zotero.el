@@ -53,6 +53,10 @@
 ;;                 created on export. Semantic filenames derived from #+TITLE.
 ;;                 Enhanced logging with reproducible zot.py command lines.
 ;;                 Fixed /dev/null → os.devnull for Windows compatibility.
+;;                 Removed template/inner-template/filter overrides — ox-zotero
+;;                 now transparently passes through ox-html's full output
+;;                 (including #+HTML_HEAD: CSS). Attachment gets full standalone
+;;                 HTML; note gets body-only content via org-zot--extract-body.
 
 ;;; Code:
 
@@ -334,50 +338,21 @@ Returns t on success, nil on failure."
       (insert (format "#+ZOTERO_ITEM_KEY: %s\n" item-key)))))
 
 ;;; ======================================================================
-;;;                         Templates
+;;;                         HTML Utilities
 ;;; ======================================================================
 
-(defun org-zot-template (contents _info)
-  "Return complete document string for Zotero note.
-CONTENTS is the transcoded contents string.  INFO is a plist.
-We strip the outer HTML wrapper — Zotero notes are body-only HTML."
-  contents)
-
-(defun org-zot-inner-template (contents _info)
-  "Return inner body content for Zotero note.
-No TOC, no footnote section — just the article body."
-  contents)
-
-;;; ======================================================================
-;;;                           Filters
-;;; ======================================================================
-
-(defun org-zot-final-output-filter (output _backend _info)
-  "Final filter to clean up HTML OUTPUT for Zotero notes.
-Strips unsupported tags and attributes."
-  ;; Remove <html>, <head>, <body> wrappers that the parent html
-  ;; backend may have added through template/inner-template chain
-  (let ((clean output))
-    ;; Strip outer <html>...</html> if present
-    (when (string-match "\\`<html[^>]*>" clean)
-      (setq clean (replace-match "" t t clean)))
-    (when (string-match "</html>\\'" clean)
-      (setq clean (replace-match "" t t clean)))
-    ;; Strip outer <body>...</body> if present
-    (when (string-match "\\`<body[^>]*>" clean)
-      (setq clean (replace-match "" t t clean)))
-    (when (string-match "</body>\\'" clean)
-      (setq clean (replace-match "" t t clean)))
-    ;; Strip outer <head> section if present
-    (when (string-match "<head>.*?</head>" clean)
-      (setq clean (replace-match "" t t clean)))
-    ;; Strip xml declaration
-    (when (string-match "\\`<\\?xml[^?]*\\?>" clean)
-      (setq clean (replace-match "" t t clean)))
-    ;; Strip doctype
-    (when (string-match "\\`<!DOCTYPE[^>]*>" clean)
-      (setq clean (replace-match "" t t clean)))
-    clean))
+(defun org-zot--extract-body (full-html)
+  "Extract body content from FULL-HTML.
+Returns everything between <body> and </body> tags.
+Used for Zotero note content, which should be body-only HTML.
+Returns FULL-HTML unchanged if no <body> tag found."
+  (let ((start (string-match "<body[^>]*>" full-html)))
+    (if start
+        (let ((body-start (match-end 0)))
+          (if (string-match "</body>" full-html body-start)
+              (substring full-html body-start (match-beginning 0))
+            full-html))
+      full-html)))
 
 ;;; ======================================================================
 ;;;                     Export Entry Points
@@ -418,18 +393,19 @@ Steps:
       (user-error "No collection specified. Set #+ZOTERO_COLLECTION or org-zot-default-collection-key"))
 
     ;; Step 1: Export HTML
-    (let ((html-body (org-export-as 'org-zot-html subtreep visible-only t ext-plist)))
-      (unless (and html-body (not (string-empty-p (string-trim html-body))))
+    (let* ((full-html (org-export-as 'org-zot-html subtreep visible-only nil ext-plist))
+         (body-html (org-zot--extract-body full-html)))
+      (unless (and full-html (not (string-empty-p (string-trim full-html))))
         (user-error "Export produced empty output"))
 
       (if item-key
           ;; Update existing item — upload attachment + note
           (progn
             (message "📎 Uploading HTML attachment to item: %s" item-key)
-            (if (org-zot--attach-file item-key html-body (org-zot--sanitize-filename title))
+            (if (org-zot--attach-file item-key full-html (org-zot--sanitize-filename title))
                 (progn
                   (message "✅ Attachment updated for item: %s" item-key)
-                  (org-zot--add-note item-key html-body))
+                  (org-zot--add-note item-key body-html))
               (user-error "Failed to upload attachment")))
         ;; Create new item
         (message "📦 Creating Zotero item...")
@@ -437,11 +413,11 @@ Steps:
           (if new-key
               (progn
                 (message "📎 Uploading HTML attachment...")
-                (if (org-zot--attach-file new-key html-body (org-zot--sanitize-filename title))
+                (if (org-zot--attach-file new-key full-html (org-zot--sanitize-filename title))
                     (progn
                       ;; Write back item key
                       (org-zot--write-item-key new-key)
-                      (org-zot--add-note new-key html-body)
+                      (org-zot--add-note new-key body-html)
                       (message "✅ Exported to Zotero! Item: %s  Collection: %s"
                                new-key coll-key))
                   (user-error "Item created (%s) but attachment upload failed" new-key)))
@@ -457,15 +433,16 @@ Requires #+ZOTERO_ITEM_KEY to be set in the buffer."
          (title (car (plist-get info-plist :title))))
     (unless item-key
       (user-error "No #+ZOTERO_ITEM_KEY found. Use `z f' to create a new item first, or set it manually."))
-    (let ((html-body (org-export-as 'org-zot-html subtreep visible-only t
-                      (org-combine-plists ext-plist info-plist))))
-      (unless (and html-body (not (string-empty-p (string-trim html-body))))
+    (let* ((full-html (org-export-as 'org-zot-html subtreep visible-only nil
+                      (org-combine-plists ext-plist info-plist)))
+         (body-html (org-zot--extract-body full-html)))
+      (unless (and full-html (not (string-empty-p (string-trim full-html))))
         (user-error "Export produced empty output"))
       (message "📎 Uploading HTML attachment to item: %s" item-key)
-      (if (org-zot--attach-file item-key html-body (org-zot--sanitize-filename title))
+      (if (org-zot--attach-file item-key full-html (org-zot--sanitize-filename title))
           (progn
             (message "✅ Attachment updated for item: %s" item-key)
-            (org-zot--add-note item-key html-body))
+            (org-zot--add-note item-key body-html))
         (user-error "Failed to upload attachment")))))
 
 (defun org-zot-show-item-key
@@ -483,12 +460,6 @@ Requires #+ZOTERO_ITEM_KEY to be set in the buffer."
 ;;; ======================================================================
 
 (org-export-define-derived-backend 'org-zot-html 'html
-  :translate-alist
-  '((template . org-zot-template)
-    (inner-template . org-zot-inner-template))
-
-  :filters-alist
-  '((:filter-final-output . org-zot-final-output-filter))
 
   :options-alist
   '((:zotero-item-type "ZOTERO_ITEM_TYPE" nil org-zot-default-item-type)
