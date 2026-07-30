@@ -57,6 +57,10 @@
 ;;                 now transparently passes through ox-html's full output
 ;;                 (including #+HTML_HEAD: CSS). Attachment gets full standalone
 ;;                 HTML; note gets body-only content via org-zot--extract-body.
+;;   - 2026-07-30: CSS auto-inlining via org-zot-css-root defcustom (ox-reveal
+;;                 pattern). CSS files in lib/ are inlined as <style> tags at
+;;                 export time — no external stylesheet dependencies, fully
+;;                 offline-safe.
 
 ;;; Code:
 
@@ -89,6 +93,18 @@ See https://www.zotero.org/support/dev/web_api/v3/types_and_fields"
   "Default Zotero collection key.
 If empty string, will prompt or fallback to Misc collection."
   :type 'string
+  :group 'org-export-zotero)
+
+(defcustom org-zot-css-root
+  (expand-file-name "lib" (file-name-directory (or load-file-name
+                                                   (buffer-file-name))))
+  "Directory containing CSS files to inline into exported HTML.
+CSS files (*.css) in this directory are read and inlined as <style>
+tags during export, ensuring the HTML attachment is self-contained
+and renders correctly offline (no external stylesheet dependencies).
+Set to nil to disable CSS inlining."
+  :type '(choice (directory :tag "CSS directory")
+                 (const :tag "Disable" nil))
   :group 'org-export-zotero)
 
 ;;; ======================================================================
@@ -354,6 +370,33 @@ Returns FULL-HTML unchanged if no <body> tag found."
             full-html))
       full-html)))
 
+(defun org-zot--inline-stylesheets (output _backend _info)
+  "Inline CSS files from `org-zot-css-root' into OUTPUT's <head>.
+Reads all *.css files from the configured directory and injects their
+content as <style> tags before </head>.  This ensures the exported HTML
+attachment is self-contained and renders offline — no <link> tags.
+Returns OUTPUT unchanged if the CSS directory is unset or missing."
+  (if-let ((css-dir (and (boundp 'org-zot-css-root)
+                         org-zot-css-root
+                         (file-directory-p org-zot-css-root)))
+           (css-files (directory-files css-dir t "\.css'")))
+      (let ((styles (mapconcat
+                     (lambda (f)
+                       (with-temp-buffer
+                         (insert-file-contents f)
+                         (buffer-string)))
+                     css-files
+                     "
+")))
+        (if (string-match "</head>" output)
+            (replace-match (concat "<style>
+" styles "
+</style>
+</head>")
+                           t t output)
+          output))
+    output))
+
 ;;; ======================================================================
 ;;;                     Export Entry Points
 ;;; ======================================================================
@@ -460,6 +503,8 @@ Requires #+ZOTERO_ITEM_KEY to be set in the buffer."
 ;;; ======================================================================
 
 (org-export-define-derived-backend 'org-zot-html 'html
+  :filters-alist
+  '((:filter-final-output . org-zot--inline-stylesheets))
 
   :options-alist
   '((:zotero-item-type "ZOTERO_ITEM_TYPE" nil org-zot-default-item-type)
