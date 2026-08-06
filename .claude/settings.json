@@ -1,0 +1,23 @@
+{
+  "worktree": {
+    "bgIsolation": "none"
+  },
+  "permissions": {
+    "Bash": {
+      "git commit*": "ask"
+    }
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash&&git commit*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/check-commit-msg.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

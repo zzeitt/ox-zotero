@@ -28,9 +28,9 @@
 ;;
 ;; Exporting:
 ;;   - M-x org-export-dispatch, then press `z' prefix.
-;;   - z b: HTML preview in buffer
-;;   - z f: Export & Create item + HTML attachment + note
-;;   - z n: Export & Update HTML attachment + note (requires #+ZOTERO_ITEM_KEY)
+;;   - z b: Preview in buffer
+;;   - z z: Create or update item + attachment + note
+;;   - z o: Open item in Zotero
 ;;   - z k: Show item key
 ;;
 ;; Options (in-buffer keywords):
@@ -39,7 +39,8 @@
 ;;   - #+ZOTERO_TAGS: Comma-separated tags (e.g. #AI-ML🤖, #编程💻)
 ;;   - #+ZOTERO_URL: Source URL
 ;;   - #+ZOTERO_EXTRA: Extra JSON for additional fields
-;;   - #+ZOTERO_ITEM_KEY: Existing item key (for update mode)
+;;   - #+ZOTERO_ITEM_KEY: Existing item key (written back on first export)
+;;   - #+ZOTERO_ATTACH_NAME: Custom attachment filename (default: <title>.html)
 ;;
 ;; Change Log:
 ;;   - 2026-07-24: Initial commit.
@@ -57,10 +58,11 @@
 ;;                 now transparently passes through ox-html's full output
 ;;                 (including #+HTML_HEAD: CSS). Attachment gets full standalone
 ;;                 HTML; note gets body-only content via org-zot--extract-body.
-;;   - 2026-07-30: CSS auto-inlining via org-zot-css-root defcustom (ox-reveal
-;;                 pattern). CSS files in lib/ are inlined as <style> tags at
-;;                 export time — no external stylesheet dependencies, fully
-;;                 offline-safe.
+;;   - 2026-07-30: Removed CSS auto-inlining and HTML container transforms —
+;;                 these now belong to ox-html-enhanced. ox-zotero is purely
+;;                 a Zotero integration backend with no HTML modification.
+;;                 Merged create/update into single `z z' command with
+;;                 auto-detect. Added `z o' to open item in Zotero desktop.
 
 ;;; Code:
 
@@ -95,16 +97,11 @@ If empty string, will prompt or fallback to Misc collection."
   :type 'string
   :group 'org-export-zotero)
 
-(defcustom org-zot-css-root
-  (expand-file-name "lib" (file-name-directory (or load-file-name
-                                                   (buffer-file-name))))
-  "Directory containing CSS files to inline into exported HTML.
-CSS files (*.css) in this directory are read and inlined as <style>
-tags during export, ensuring the HTML attachment is self-contained
-and renders correctly offline (no external stylesheet dependencies).
-Set to nil to disable CSS inlining."
-  :type '(choice (directory :tag "CSS directory")
-                 (const :tag "Disable" nil))
+(defcustom org-zot-tag-prefix ""
+  "Optional prefix added to each tag when syncing to Zotero.
+Set to \"#\" if you prefer Zotero tags to appear as #tag-name.
+The prefix is applied at sync time — Org file tags are stored without it."
+  :type 'string
   :group 'org-export-zotero)
 
 ;;; ======================================================================
@@ -167,8 +164,8 @@ Otherwise, search collections by name."
            (string-match-p "^[A-Z0-9]+$" name-or-key))
       ;; Looks like a Zotero key — use directly
       name-or-key
-    ;; Search by name in `zot collections' output
-    (let ((output (org-zot--call-zot-ok '("collections"))))
+    ;; Search by name in `zot coll list' output
+    (let ((output (org-zot--call-zot-ok '("coll" "list"))))
       (when output
         (with-temp-buffer
           (insert output)
@@ -194,6 +191,15 @@ Returns a plist with keys: :title :item-type :url :coll-key :tags :extra."
          (zotero-extra (plist-get info :zotero-extra))
          (zotero-coll (plist-get info :zotero-collection))
          (zotero-key (plist-get info :zotero-item-key))
+         ;; Tags: prefer Org native :filetags, fallback to #+ZOTERO_TAGS:
+         (org-filetags (plist-get info :filetags))
+         (tags (cond
+                ;; Org native filetags: already a list, e.g. ("tag1" "tag2")
+                (org-filetags org-filetags)
+                ;; Fallback: #+ZOTERO_TAGS: "tag1, tag2" → ("tag1" "tag2")
+                ((and zotero-tags-raw (not (string-empty-p zotero-tags-raw)))
+                 (mapcar #'string-trim (split-string zotero-tags-raw ",")))
+                (t nil)))
          ;; Default URL to file:// if none specified
          (url (or zotero-url
                   (when buffer-file-name
@@ -206,11 +212,7 @@ Returns a plist with keys: :title :item-type :url :coll-key :tags :extra."
           :item-type item-type
           :url (or url "")
           :coll-key (or coll-key "")
-          :tags (if (and zotero-tags-raw
-                         (not (string-empty-p zotero-tags-raw)))
-                    (mapcar #'string-trim
-                            (split-string zotero-tags-raw ","))
-                  nil)
+          :tags tags
           :extra zotero-extra
           :item-key zotero-key)))
 
@@ -227,12 +229,13 @@ Returns a list of strings suitable for `org-zot--call-zot'."
     ;; Build extra JSON
     (let ((extra-alist nil))
       (when tags
-        (push (cons 'tags
-                    (vconcat
-                     (mapcar (lambda (tag)
-                               `((tag . ,tag) (type . 1)))
-                             tags)))
-              extra-alist))
+        (let ((prefixed (org-zot--prefix-tags tags)))
+          (push (cons 'tags
+                      (vconcat
+                       (mapcar (lambda (tag)
+                                 `((tag . ,tag) (type . 1)))
+                               prefixed)))
+                extra-alist)))
       (when extra
         (condition-case nil
             (let ((parsed (json-parse-string extra)))
@@ -244,7 +247,7 @@ Returns a list of strings suitable for `org-zot--call-zot'."
                            (json-encode extra-alist)
                          nil)))
     ;; Build args list
-    (append (list "add" item-type title url coll-key)
+    (append (list "item" "add" item-type title url coll-key)
             (when extra-json
               (list extra-json)))))
 
@@ -298,8 +301,8 @@ Returns t on success, nil on failure."
     (message "📝 HTML saved to: %s" tmpfile)
     (unwind-protect
         (let ((args (if archive-filename
-                        (list "attach" item-key tmpfile archive-filename)
-                      (list "attach" item-key tmpfile))))
+                        (list "attachment" "add" item-key tmpfile archive-filename)
+                      (list "attachment" "add" item-key tmpfile))))
           (let ((output (org-zot--call-zot-ok args)))
             (if (and output (string-match "✅ Attachment saved" output))
                 (setq success t)
@@ -321,10 +324,10 @@ Returns t on success, nil on failure."
 
 (defun org-zot--add-note (item-key html-content)
   "Add HTML-CONTENT as a child note to Zotero item ITEM-KEY.
-Uses `zot.py addnote' with the HTML piped via stdin.
+Uses `zot.py note set' with the HTML piped via stdin.
 Returns t on success, nil on failure."
   (message "📝 Adding note to item: %s" item-key)
-  (let ((output (org-zot--call-zot-ok (list "setnote" item-key) html-content)))
+  (let ((output (org-zot--call-zot-ok (list "note" "set" item-key) html-content)))
     (if output
         (progn
           (message "✅ Note added to item: %s" item-key)
@@ -332,6 +335,122 @@ Returns t on success, nil on failure."
       (progn
         (message "⚠️ Note upload failed for item: %s" item-key)
         nil))))
+
+(defun org-zot--prefix-tags (tags)
+  "Apply `org-zot-tag-prefix' to each tag in TAGS.
+Returns a new list with the prefix prepended to each tag.
+When `org-zot-tag-prefix' is empty, returns TAGS unchanged."
+  (if (or (null org-zot-tag-prefix)
+          (string-empty-p org-zot-tag-prefix))
+      tags
+    (mapcar (lambda (tag) (concat org-zot-tag-prefix tag)) tags)))
+
+(defun org-zot--sync-tags (item-key tags)
+  "Sync TAGS to Zotero item ITEM-KEY via `zot.py tag set'.
+TAGS is a list of tag strings from #+FILETAGS: or #+ZOTERO_TAGS:.
+Applies `org-zot-tag-prefix' to each tag before syncing.
+Uses `tag set' (replace) because the Org file is the source of truth.
+Passing nil or empty TAGS clears all tags on the item."
+  (let* ((prefixed (org-zot--prefix-tags tags))
+         (args (if prefixed
+                   (append (list "tag" "set" item-key) prefixed)
+                 (list "tag" "set" item-key)))
+         (tag-str (if prefixed
+                       (mapconcat #'identity prefixed ", ")
+                     "(clear)")))
+    (message "🏷️  Syncing tags: %s" tag-str)
+    (if (org-zot--call-zot-ok args)
+        (message "✅ Tags synced: %s" tag-str)
+      (message "⚠️ Tag sync failed for item: %s" item-key))))
+
+(defun org-zot--parse-children (output)
+  "Parse children from `zot.py attachment list' OUTPUT.
+Returns a plist (:attachments ((key . name) ...) :notes ((key . preview) ...)).
+Parses line-by-line: each 🔑 line contains either a MIME type (attachment)
+or a quoted string (note).  v2.0.0+ format with linkMode field is handled."
+  (let ((attachments nil)
+        (notes nil))
+    (dolist (line (split-string output "\n"))
+      (when (string-match
+             "🔑\\s-+\\([A-Z0-9]\\{8\\}\\)\\s-*|\\s-*\\(.+\\)" line)
+        (let ((key (match-string 1 line))
+              (rest (string-trim (match-string 2 line))))
+          (cond
+           ;; Note: starts with a double-quote
+           ((string-prefix-p "\"" rest)
+            (push (cons key (string-trim rest "\"" "\"")) notes))
+           ;; Attachment: contains a MIME type (has a slash)
+           ((string-match-p "/" rest)
+            ;; v2.0.0 format: "text/html | linkMode=xxx | filename.html"
+            ;; Extract filename from last pipe segment
+            (let ((name (if (string-match "|\\s-*\\([^|]+\\)\\'" rest)
+                            (string-trim (match-string 1 rest))
+                          ;; Fallback: take first field (content-type)
+                          (car (split-string rest "|" t "\\s-*")))))
+              (push (cons key name) attachments)))))))
+    (list :attachments (nreverse attachments)
+          :notes (nreverse notes))))
+
+(defun org-zot--update-attachment (item-key html-content attach-name)
+  "Upload or re-upload HTML-CONTENT as a file attachment to ITEM-KEY.
+Uses `zot attachment update' if an existing attachment child exists,
+otherwise falls back to `zot attachment add'.  Old notes are removed
+before `zot note set' creates a fresh one.
+Returns t on success, nil on failure."
+  (let* ((output (org-zot--call-zot-ok (list "attachment" "list" item-key)))
+         (children (if output (org-zot--parse-children output)
+                     (list :attachments nil :notes nil)))
+         (att-entries (plist-get children :attachments))
+         (note-entries (plist-get children :notes)))
+    (message "🔍 Parsed children: %d attachment(s), %d note(s)"
+             (length att-entries) (length note-entries))
+    (let* ((tmpdir (make-temp-file "ox-zotero-" t))
+         (fname (or attach-name "ox-zotero-export.html"))
+         (tmpfile (expand-file-name fname tmpdir))
+         (success nil))
+    ;; Write HTML to temp file
+    (make-directory (file-name-directory tmpfile) t)
+    (with-temp-file tmpfile
+      (insert html-content))
+    (message "📝 HTML saved to: %s" tmpfile)
+    ;; Remove old notes (note set will create a fresh one)
+    (dolist (entry note-entries)
+      (org-zot--call-zot-ok (list "attachment" "remove" (car entry)))
+      (message "🗑️  Detached old note: %s (%s)" (car entry) (cdr entry)))
+    (unwind-protect
+        (cond
+         ;; Existing attachment → reattach to first, detach extras
+         (att-entries
+          (let ((first-key (car (car att-entries)))
+                (first-name (cdr (car att-entries)))
+                (extra (cdr att-entries)))
+            (message "🔄 Reattaching to child: %s (%s)" first-key first-name)
+            (setq success
+                  (if (org-zot--call-zot-ok
+                       (list "attachment" "update" first-key tmpfile fname))
+                      t
+                    nil))
+            (dolist (entry extra)
+              (org-zot--call-zot-ok (list "attachment" "remove" (car entry)))
+              (message "🗑️  Detached extra attachment: %s (%s)"
+                       (car entry) (cdr entry)))))
+         ;; No existing attachment → create new
+         (t
+          (message "📎 Creating new attachment for item: %s" item-key)
+          (setq success
+                (if (let ((output (org-zot--call-zot-ok
+                                   (list "attachment" "add" item-key tmpfile fname))))
+                      (and output
+                           (string-match "✅ Attachment saved" output)))
+                    t
+                  nil))))
+      ;; Cleanup
+      (if success
+          (progn
+            (delete-directory tmpdir t)
+            (message "🧹 Cleaned up: %s" tmpdir))
+        (message "💾 Temp file kept for debugging: %s" tmpfile)))
+    success)))
 
 ;;; ======================================================================
 ;;;                   In-Buffer Keyword Write-back
@@ -370,33 +489,6 @@ Returns FULL-HTML unchanged if no <body> tag found."
             full-html))
       full-html)))
 
-(defun org-zot--inline-stylesheets (output _backend _info)
-  "Inline CSS files from `org-zot-css-root' into OUTPUT's <head>.
-Reads all *.css files from the configured directory and injects their
-content as <style> tags before </head>.  This ensures the exported HTML
-attachment is self-contained and renders offline — no <link> tags.
-Returns OUTPUT unchanged if the CSS directory is unset or missing."
-  (if-let ((css-dir (and (boundp 'org-zot-css-root)
-                         org-zot-css-root
-                         (file-directory-p org-zot-css-root)))
-           (css-files (directory-files css-dir t "\.css'")))
-      (let ((styles (mapconcat
-                     (lambda (f)
-                       (with-temp-buffer
-                         (insert-file-contents f)
-                         (buffer-string)))
-                     css-files
-                     "
-")))
-        (if (string-match "</head>" output)
-            (replace-match (concat "<style>
-" styles "
-</style>
-</head>")
-                           t t output)
-          output))
-    output))
-
 ;;; ======================================================================
 ;;;                     Export Entry Points
 ;;; ======================================================================
@@ -412,14 +504,10 @@ The HTML shown is what would be sent as a Zotero note."
 
 (defun org-zot-export-to-zotero
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export org article to Zotero: create item + HTML attachment + note.
-Steps:
-  1. Extract metadata from buffer (#+TITLE:, #+ZOTERO_TAGS:, etc.)
-  2. Export body to HTML via org-zot-html backend
-  3. Call `zot.py add' to create the item
-  4. Call `zot.py attach' to upload HTML as a file attachment
-  5. Call `zot.py addnote' to add the same HTML as a child note
-  6. Write back #+ZOTERO_ITEM_KEY to the buffer"
+  "Export org article to Zotero — create or update.
+If no #+ZOTERO_ITEM_KEY exists, creates a new item and writes the key
+back to the buffer.  If the key already exists, cleans up old
+attachments/notes and re-uploads."
   (interactive)
   (let* ((info-plist (org-combine-plists
                       ext-plist
@@ -427,66 +515,57 @@ Steps:
          (metadata (org-zot--extract-metadata info-plist))
          (item-key (plist-get metadata :item-key))
          (coll-key (plist-get metadata :coll-key))
-         (title (plist-get metadata :title)))
+         (title    (plist-get metadata :title))
+         (attach-name (or (plist-get info-plist :zotero-attach-name)
+                          (org-zot--sanitize-filename title))))
 
-    ;; Validate
     (unless title
-      (user-error "No #+TITLE: found in buffer — cannot create Zotero item"))
+      (user-error "No #+TITLE: found in buffer"))
     (unless (and coll-key (not (string-empty-p coll-key)))
       (user-error "No collection specified. Set #+ZOTERO_COLLECTION or org-zot-default-collection-key"))
 
-    ;; Step 1: Export HTML
     (let* ((full-html (org-export-as 'org-zot-html subtreep visible-only nil ext-plist))
-         (body-html (org-zot--extract-body full-html)))
+           (body-html (org-zot--extract-body full-html)))
       (unless (and full-html (not (string-empty-p (string-trim full-html))))
         (user-error "Export produced empty output"))
 
       (if item-key
-          ;; Update existing item — upload attachment + note
+          ;; Update: replace attachment in-place, update note, sync tags
           (progn
-            (message "📎 Uploading HTML attachment to item: %s" item-key)
-            (if (org-zot--attach-file item-key full-html (org-zot--sanitize-filename title))
+            (message "Uploading to item: %s" item-key)
+            (if (org-zot--update-attachment item-key full-html attach-name)
                 (progn
-                  (message "✅ Attachment updated for item: %s" item-key)
-                  (org-zot--add-note item-key body-html))
+                  (message "Updated: %s" item-key)
+                  (org-zot--add-note item-key body-html)
+                  (org-zot--sync-tags item-key (plist-get metadata :tags)))
               (user-error "Failed to upload attachment")))
-        ;; Create new item
-        (message "📦 Creating Zotero item...")
+        ;; Create: new item, write back key, upload
+        (message "Creating Zotero item...")
         (let ((new-key (org-zot--create-item metadata)))
           (if new-key
               (progn
-                (message "📎 Uploading HTML attachment...")
-                (if (org-zot--attach-file new-key full-html (org-zot--sanitize-filename title))
+                (message "Uploading HTML attachment...")
+                (if (org-zot--attach-file new-key full-html attach-name)
                     (progn
-                      ;; Write back item key
                       (org-zot--write-item-key new-key)
                       (org-zot--add-note new-key body-html)
-                      (message "✅ Exported to Zotero! Item: %s  Collection: %s"
+                      (message "Exported to Zotero! Item: %s  Collection: %s"
                                new-key coll-key))
                   (user-error "Item created (%s) but attachment upload failed" new-key)))
             (user-error "Failed to create Zotero item")))))))
 
-(defun org-zot-export-note-to-zotero
+(defun org-zot-open-in-zotero
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export org article and update HTML attachment + note on an existing Zotero item.
-Requires #+ZOTERO_ITEM_KEY to be set in the buffer."
+  "Open the current buffer's Zotero item in the Zotero desktop app.
+Requires #+ZOTERO_ITEM_KEY to be set."
   (interactive)
   (let* ((info-plist (org-export--get-inbuffer-options 'org-zot-html))
-         (item-key (plist-get info-plist :zotero-item-key))
-         (title (car (plist-get info-plist :title))))
+         (item-key (plist-get info-plist :zotero-item-key)))
     (unless item-key
-      (user-error "No #+ZOTERO_ITEM_KEY found. Use `z f' to create a new item first, or set it manually."))
-    (let* ((full-html (org-export-as 'org-zot-html subtreep visible-only nil
-                      (org-combine-plists ext-plist info-plist)))
-         (body-html (org-zot--extract-body full-html)))
-      (unless (and full-html (not (string-empty-p (string-trim full-html))))
-        (user-error "Export produced empty output"))
-      (message "📎 Uploading HTML attachment to item: %s" item-key)
-      (if (org-zot--attach-file item-key full-html (org-zot--sanitize-filename title))
-          (progn
-            (message "✅ Attachment updated for item: %s" item-key)
-            (org-zot--add-note item-key body-html))
-        (user-error "Failed to upload attachment")))))
+      (user-error "No #+ZOTERO_ITEM_KEY found in buffer"))
+    (let ((uri (format "zotero://select/items/%s" item-key)))
+      (message "Opening: %s" uri)
+      (browse-url uri))))
 
 (defun org-zot-show-item-key
     (&optional async subtreep visible-only body-only ext-plist)
@@ -503,22 +582,20 @@ Requires #+ZOTERO_ITEM_KEY to be set in the buffer."
 ;;; ======================================================================
 
 (org-export-define-derived-backend 'org-zot-html 'html
-  :filters-alist
-  '((:filter-final-output . org-zot--inline-stylesheets))
-
   :options-alist
   '((:zotero-item-type "ZOTERO_ITEM_TYPE" nil org-zot-default-item-type)
     (:zotero-collection "ZOTERO_COLLECTION" nil nil)
     (:zotero-tags "ZOTERO_TAGS" nil nil)
     (:zotero-url "ZOTERO_URL" nil nil)
     (:zotero-extra "ZOTERO_EXTRA" nil nil)
-    (:zotero-item-key "ZOTERO_ITEM_KEY" nil nil))
+    (:zotero-item-key "ZOTERO_ITEM_KEY" nil nil)
+    (:zotero-attach-name "ZOTERO_ATTACH_NAME" nil nil))
 
   :menu-entry
   '(?z "Export to Zotero"
-       ((?b "HTML preview in buffer" org-zot-export-to-buffer)
-        (?f "Export & Create item + attachment + note" org-zot-export-to-zotero)
-        (?n "Export & Update attachment + note" org-zot-export-note-to-zotero)
+       ((?b "Preview in buffer" org-zot-export-to-buffer)
+        (?z "Create or update" org-zot-export-to-zotero)
+        (?o "Open in Zotero" org-zot-open-in-zotero)
         (?k "Show item key" org-zot-show-item-key))))
 
 (provide 'ox-zotero)
