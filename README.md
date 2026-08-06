@@ -12,7 +12,7 @@
 
 ### 1. zot.py CLI 工具
 
-需要安装 [zot-tool](https://github.com/zzeitt/zot-tool)（≥ v1.8.5）：
+需要安装 [zot-tool](https://github.com/zzeitt/zot-tool)（≥ v2.0.0）：
 
 ```bash
 git clone https://github.com/zzeitt/zot-tool.git ~/.claude/skills/zot-tool
@@ -62,6 +62,9 @@ export ZOTERO_WEBDAV_PASS="your-webdav-pass"
 
 ;; 默认 Collection key（可选）
 (setq org-zot-default-collection-key "")
+
+;; Tag 前缀（可选，默认 ""）。设为 "#" 则 Zotero 中 tag 显示为 #tag-name
+(setq org-zot-tag-prefix "#")
 ```
 
 ## Org 文件前置声明
@@ -100,13 +103,13 @@ export ZOTERO_WEBDAV_PASS="your-webdav-pass"
 
 ### `z z`（创建或更新）
 
-1. 提取元数据（`#+TITLE:`、`#+ZOTERO_TAGS:` 等）
+1. 提取元数据（`#+TITLE:`、`#+FILETAGS:` 等）
 2. ox-html 将 Org 导出为**完整 HTML**
-3. **无 `#+ZOTERO_ITEM_KEY`** → `zot.py add` 创建条目 → 写回 key → 上传附件 + note
-4. **已有 `#+ZOTERO_ITEM_KEY`** → 清理旧附件/Note → 重新上传 → 同步 tags
+3. **无 `#+ZOTERO_ITEM_KEY`** → `zot item add` 创建条目 → 写回 key → 上传附件 + note
+4. **已有 `#+ZOTERO_ITEM_KEY`** → `zot attachment list` 列出子条目 → `zot attachment update` 原地更新附件（保留 child key）→ `zot note set` 更新 note → `zot tag set` 同步 tags
 5. 上传 HTML 附件（文件名取自 `#+ZOTERO_ATTACH_NAME:` 或 `#+TITLE:`）
 6. 写入 body-only HTML 作为 child note
-7. 同步 tags：`#+ZOTERO_TAGS:` 为空则清空所有标签
+7. 同步 tags：Org 文件为唯一真相源，`zot tag set` 替换 Zotero 端全部 tags
 
 ### 错误处理
 
@@ -146,14 +149,15 @@ ox-html-enhanced 负责：
 
 ```
 ox-zotero.el
-  ├── defcustom 选项（5 个）
+  ├── defcustom 选项（6 个）
   ├── Subprocess Bridge（call-process-region 封装）
   ├── Collection 解析
   ├── 元数据提取 & zot.py 参数构建
-  ├── Item 创建、附件上传、Note 写入
+  ├── Tag 前缀处理（org-zot-tag-prefix）
+  ├── Item 创建、附件原地更新、Note 写入
   ├── HTML 工具（org-zot--extract-body 提取 body 给 note）
   ├── Item Key 写回
-  ├── 导出入口（z b / z f / z n / z k）
+  ├── 导出入口（z b / z z / z o / z k）
   └── Backend Definition（纯选项 + 菜单，无覆盖，无 filter）
 ```
 
@@ -164,10 +168,14 @@ ox-zotero.el
   ├── ox（org-export-define-derived-backend）
   ├── ox-html（父后端，所有 element transcoder）
   ├── json（ZOTERO_EXTRA 解析）
-  └── zot.py CLI
-        ├── zot add     → 创建 Zotero 条目
-        ├── zot attach  → 上传 HTML 附件（WebDAV）
-        └── zot setnote → 写入原始 Note（无 LLM 摘要）
+  └── zot.py CLI (v2.0.0+)
+        ├── zot item add               → 创建 Zotero 条目
+        ├── zot attachment add         → 上传 HTML 附件（WebDAV）
+        ├── zot attachment list        → 列出子条目（附件 + note）
+        ├── zot attachment update      → 原地更新附件内容（保留 child key）
+        ├── zot attachment remove      → 删除子条目
+        ├── zot note set               → 写入原始 Note（无 LLM 摘要）
+        └── zot tag set                → 替换全部 tags
 ```
 
 ## 许可
