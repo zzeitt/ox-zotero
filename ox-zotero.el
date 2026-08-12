@@ -104,6 +104,13 @@ The prefix is applied at sync time — Org file tags are stored without it."
   :type 'string
   :group 'org-export-zotero)
 
+(defcustom org-zot-debug nil
+  "When non-nil, emit diagnostic messages during export.
+Includes md5 fingerprints and content previews for tracing
+stale HTML issues in the export pipeline."
+  :type 'boolean
+  :group 'org-export-zotero)
+
 ;;; ======================================================================
 ;;;                   Subprocess Bridge (zot.py)
 ;;; ======================================================================
@@ -413,6 +420,9 @@ Returns t on success, nil on failure."
     (with-temp-file tmpfile
       (insert html-content))
     (message "📝 HTML saved to: %s" tmpfile)
+    (when org-zot-debug
+      (message "🔬 DIAG-update: html-content md5=%s len=%d"
+               (md5 html-content) (length html-content)))
     ;; Remove old notes (note set will create a fresh one)
     (dolist (entry note-entries)
       (org-zot--call-zot-ok (list "attachment" "remove" (car entry)))
@@ -498,7 +508,7 @@ Returns FULL-HTML unchanged if no <body> tag found."
   "Export current org buffer as HTML and display in a preview buffer.
 The HTML shown is what would be sent as a Zotero note."
   (interactive)
-  (org-export-to-buffer 'org-zot-html "*Zotero HTML Export*"
+  (org-export-to-buffer 'html "*Zotero HTML Export*"
     async subtreep visible-only body-only ext-plist
     (lambda () (html-mode))))
 
@@ -524,11 +534,14 @@ attachments/notes and re-uploads."
     (unless (and coll-key (not (string-empty-p coll-key)))
       (user-error "No collection specified. Set #+ZOTERO_COLLECTION or org-zot-default-collection-key"))
 
-    (let* ((full-html (org-export-as 'org-zot-html subtreep visible-only nil ext-plist))
+    (let* ((full-html (org-export-as 'html subtreep visible-only nil ext-plist))
            (body-html (org-zot--extract-body full-html)))
       (unless (and full-html (not (string-empty-p (string-trim full-html))))
         (user-error "Export produced empty output"))
-
+      (when org-zot-debug
+      (message "🔬 DIAG-export: body md5=%s len=%d first-150=%s"
+               (md5 body-html) (length body-html)
+               (substring body-html 0 (min 150 (length body-html)))))
       (if item-key
           ;; Update: replace attachment in-place, update note, sync tags
           (progn

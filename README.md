@@ -65,6 +65,9 @@ export ZOTERO_WEBDAV_PASS="your-webdav-pass"
 
 ;; Tag 前缀（可选，默认 ""）。设为 "#" 则 Zotero 中 tag 显示为 #tag-name
 (setq org-zot-tag-prefix "#")
+
+;; 诊断开关（可选，默认 nil）。设为 t 则输出 md5 指纹等诊断信息
+(setq org-zot-debug nil)
 ```
 
 ## Org 文件前置声明
@@ -149,11 +152,12 @@ ox-html-enhanced 负责：
 
 ```
 ox-zotero.el
-  ├── defcustom 选项（6 个）
+  ├── defcustom 选项（7 个，含 org-zot-debug 诊断开关）
   ├── Subprocess Bridge（call-process-region 封装）
   ├── Collection 解析
   ├── 元数据提取 & zot.py 参数构建
   ├── Tag 前缀处理（org-zot-tag-prefix）
+  ├── 诊断日志（org-zot-debug，默认关闭）
   ├── Item 创建、附件原地更新、Note 写入
   ├── HTML 工具（org-zot--extract-body 提取 body 给 note）
   ├── Item Key 写回
