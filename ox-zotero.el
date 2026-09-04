@@ -63,6 +63,11 @@
 ;;                 a Zotero integration backend with no HTML modification.
 ;;                 Merged create/update into single `z z' command with
 ;;                 auto-detect. Added `z o' to open item in Zotero desktop.
+;;   - 2026-09-04: Export through the `org-zot-html' backend (instead of bare
+;;                 `html') so ox-html-enhanced can scope its static-math
+;;                 (dvipng+base64) forcing to Zotero only; plain html and
+;;                 ox-conf (Confluence) exports are no longer turned into
+;;                 formula images.
 
 ;;; Code:
 
@@ -508,7 +513,7 @@ Returns FULL-HTML unchanged if no <body> tag found."
   "Export current org buffer as HTML and display in a preview buffer.
 The HTML shown is what would be sent as a Zotero note."
   (interactive)
-  (org-export-to-buffer 'html "*Zotero HTML Export*"
+  (org-export-to-buffer 'org-zot-html "*Zotero HTML Export*"
     async subtreep visible-only body-only ext-plist
     (lambda () (html-mode))))
 
@@ -534,7 +539,7 @@ attachments/notes and re-uploads."
     (unless (and coll-key (not (string-empty-p coll-key)))
       (user-error "No collection specified. Set #+ZOTERO_COLLECTION or org-zot-default-collection-key"))
 
-    (let* ((full-html (org-export-as 'html subtreep visible-only nil ext-plist))
+    (let* ((full-html (org-export-as 'org-zot-html subtreep visible-only nil ext-plist))
            (body-html (org-zot--extract-body full-html)))
       (unless (and full-html (not (string-empty-p (string-trim full-html))))
         (user-error "Export produced empty output"))
