@@ -84,12 +84,13 @@ export ZOTERO_WEBDAV_PASS="your-webdav-pass"
 ```
 
 - `#+TITLE:` —— **必填**，同时作为 Zotero 条目标题和附件文件名
-- `#+FILETAGS:` —— 可选，Org 原生语法（冒号分隔）。Create 时写入，Update 时同步覆盖
+- `#+FILETAGS:` —— 可选，Org 原生语法（冒号分隔）。写作时新增的 tag 会推送到 Zotero（增量，Zotero 为权威）
 - `#+ZOTERO_COLLECTION:` —— **必填**，8 位 key 或名称
 - `#+ZOTERO_ITEM_TYPE:` —— 默认 `blogPost`
 - `#+ZOTERO_TAGS:` —— 可选（兼容旧版），逗号分隔。`#+FILETAGS:` 优先
 - `#+ZOTERO_ATTACH_NAME:` —— 可选，自定义附件文件名（默认取自 `#+TITLE:`）
 - `#+ZOTERO_ITEM_KEY` —— 首次 `z z` 后自动写回，无需手动设置
+- `#+ZOTERO_SYNCED_TAGS:` —— tag 同步快照（上次已推送的 tag），自动写回，无需手动设置
 
 ## 使用
 
@@ -109,10 +110,10 @@ export ZOTERO_WEBDAV_PASS="your-webdav-pass"
 1. 提取元数据（`#+TITLE:`、`#+FILETAGS:` 等）
 2. ox-html 将 Org 导出为**完整 HTML**
 3. **无 `#+ZOTERO_ITEM_KEY`** → `zot item add` 创建条目 → 写回 key → 上传附件 + note
-4. **已有 `#+ZOTERO_ITEM_KEY`** → `zot attachment list` 列出子条目 → `zot attachment update` 原地更新附件（保留 child key）→ `zot note set` 更新 note → `zot tag set` 同步 tags
+4. **已有 `#+ZOTERO_ITEM_KEY`** → `zot attachment list` 列出子条目 → `zot attachment update` 原地更新附件（保留 child key）→ `zot note set` 更新 note → 推送新增 tag（`zot tag add`）
 5. 上传 HTML 附件（文件名取自 `#+ZOTERO_ATTACH_NAME:` 或 `#+TITLE:`）
 6. 写入 body-only HTML 作为 child note
-7. 同步 tags：Org 文件为唯一真相源，`zot tag set` 替换 Zotero 端全部 tags
+7. 同步 tags：Zotero 为权威，只把 Org 相对上次新增的 tag 推上去（`zot tag add`）；删除在 Zotero 做，Org 删 tag 不回删、Zotero 删 tag 不复活
 
 ### 错误处理
 
@@ -179,7 +180,7 @@ ox-zotero.el
         ├── zot attachment update      → 原地更新附件内容（保留 child key）
         ├── zot attachment remove      → 删除子条目
         ├── zot note set               → 写入原始 Note（无 LLM 摘要）
-        └── zot tag set                → 替换全部 tags
+        └── zot tag add                → 推送 Org 新增 tag（Zotero 权威）
 ```
 
 ## 许可
