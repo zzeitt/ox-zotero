@@ -319,12 +319,9 @@ Returns t on success, nil on failure."
             (if (and output (string-match "✅ Attachment saved" output))
                 (setq success t)
               (progn
-                (message "⚠️ Attachment upload failed\n  Temp file: %s\n  Retry: %s %s %s %s %s"
+                (message "⚠️ Attachment upload failed\n  Temp file: %s\n  Retry: %s"
                          tmpfile
-                         org-zot-python-command
-                         org-zot-script-path
-                         "attach" item-key tmpfile
-                         (or archive-filename ""))
+                         (org-zot--command-string args))
                 nil))))
       ;; Clean up temp directory on success
       (if success
