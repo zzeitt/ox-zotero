@@ -40,6 +40,7 @@
 ;;   - #+ZOTERO_URL: Source URL
 ;;   - #+ZOTERO_EXTRA: Extra JSON for additional fields
 ;;   - #+ZOTERO_ITEM_KEY: Existing item key (written back on first export)
+;;   - #+ZOTERO_SYNCED_TAGS: Tag-sync snapshot (auto-written back)
 ;;   - #+ZOTERO_ATTACH_NAME: Custom attachment filename (default: <title>.html)
 ;;
 ;; Change Log:
@@ -149,20 +150,36 @@ Returns a cons cell: (exit-code . output-string)."
                     args)))
         (let ((output (buffer-string)))
           (if (= 0 exit-code)
-              (message "✅ zot.py OK")
+              (let ((trimmed (string-trim output)))
+                (if (string-empty-p trimmed)
+                    (message "✅ zot.py OK")
+                  ;; Surface zot.py's stdout even on exit 0: zot.py often
+                  ;; prints ❌/⚠️ then returns None WITHOUT a non-zero exit
+                  ;; (e.g. stale/deleted item key, missing WebDAV), which
+                  ;; would otherwise be masked as a misleading "OK".
+                  (message "zot.py: %s" trimmed)))
             (message "❌ zot.py exit=%d\n  CMD: %s\n  STDOUT:\n%s\n  STDERR: (see above or run CMD manually)"
                      exit-code cmd-str output))
           (cons exit-code output))))))
 
 (defun org-zot--call-zot-ok (args &optional stdin-str)
-  "Like `org-zot--call-zot' but returns output on success, nil on failure."
-  (let ((result (org-zot--call-zot args stdin-str)))
-    (if (= 0 (car result))
-        (cdr result)
-      (progn
-        (message "⚠️ zot.py failed — reproduce with:\n  %s"
-                 (org-zot--command-string args))
-        nil))))
+  "Like `org-zot--call-zot' but returns output on success, nil on failure.
+A call counts as failure when zot.py exits non-zero OR prints \"❌\" on
+stdout — zot.py reports many errors (stale item key, WebDAV failure, ...)
+by printing \"❌ ...\" yet still exiting 0.  Relying on the exit code
+alone would mistake those for success and, in tag sync, advance the
+#+ZOTERO_SYNCED_TAGS snapshot even though the tags never landed."
+  (let* ((result (org-zot--call-zot args stdin-str))
+         (exit-code (car result))
+         (output (cdr result)))
+    (if (and (= 0 exit-code)
+             (not (string-match-p "❌" output)))
+        output
+      (message "⚠️ zot.py failed (exit=%d%s) — reproduce with:\n  %s"
+               exit-code
+               (if (string-match-p "❌" output) ", ❌ on stdout" "")
+               (org-zot--command-string args))
+      nil)))
 
 ;;; ======================================================================
 ;;;                   Collection Resolution
@@ -194,7 +211,7 @@ Otherwise, search collections by name."
 
 (defun org-zot--extract-metadata (info)
   "Extract Zotero item fields from the export communication channel INFO.
-Returns a plist with keys: :title :item-type :url :coll-key :tags :extra."
+Returns a plist with keys: :title :item-type :url :coll-key :tags :synced-tags :extra."
   (let* ((item-type (or (plist-get info :zotero-item-type)
                         org-zot-default-item-type))
          (title (car (plist-get info :title)))
@@ -212,6 +229,10 @@ Returns a plist with keys: :title :item-type :url :coll-key :tags :extra."
                 ((and zotero-tags-raw (not (string-empty-p zotero-tags-raw)))
                  (mapcar #'string-trim (split-string zotero-tags-raw ",")))
                 (t nil)))
+         ;; Last-synced snapshot of Org tags (#+ZOTERO_SYNCED_TAGS:)
+         (synced-tags (let ((raw (plist-get info :zotero-synced-tags)))
+                        (and raw (not (string-empty-p raw))
+                             (mapcar #'string-trim (split-string raw ",")))))
          ;; Default URL to file:// if none specified
          (url (or zotero-url
                   (when buffer-file-name
@@ -225,6 +246,7 @@ Returns a plist with keys: :title :item-type :url :coll-key :tags :extra."
           :url (or url "")
           :coll-key (or coll-key "")
           :tags tags
+          :synced-tags synced-tags
           :extra zotero-extra
           :item-key zotero-key)))
 
@@ -238,6 +260,7 @@ Returns a list of strings suitable for `org-zot--call-zot'."
          (extra (plist-get metadata :extra))
          (tags (plist-get metadata :tags))
          (extra-json nil))
+    (org-zot--check-tags tags)
     ;; Build extra JSON
     (let ((extra-alist nil))
       (when tags
@@ -342,6 +365,9 @@ Returns t on success, nil on failure."
   (let ((output (org-zot--call-zot-ok (list "note" "set" item-key) html-content)))
     (if output
         (progn
+          (let ((msg (string-trim output)))
+            (unless (string-empty-p msg)
+              (message "ℹ️ zot.py: %s" msg)))
           (message "✅ Note added to item: %s" item-key)
           t)
       (progn
@@ -357,23 +383,95 @@ When `org-zot-tag-prefix' is empty, returns TAGS unchanged."
       tags
     (mapcar (lambda (tag) (concat org-zot-tag-prefix tag)) tags)))
 
-(defun org-zot--sync-tags (item-key tags)
-  "Sync TAGS to Zotero item ITEM-KEY via `zot.py tag set'.
-TAGS is a list of tag strings from #+FILETAGS: or #+ZOTERO_TAGS:.
-Applies `org-zot-tag-prefix' to each tag before syncing.
-Uses `tag set' (replace) because the Org file is the source of truth.
-Passing nil or empty TAGS clears all tags on the item."
-  (let* ((prefixed (org-zot--prefix-tags tags))
-         (args (if prefixed
-                   (append (list "tag" "set" item-key) prefixed)
-                 (list "tag" "set" item-key)))
-         (tag-str (if prefixed
-                       (mapconcat #'identity prefixed ", ")
-                     "(clear)")))
-    (message "🏷️  Syncing tags: %s" tag-str)
-    (if (org-zot--call-zot-ok args)
-        (message "✅ Tags synced: %s" tag-str)
-      (message "⚠️ Tag sync failed for item: %s" item-key))))
+(defun org-zot--set-difference (a b)
+  "Return elements of A not present in B (comparison by string equality)."
+  (let ((result nil))
+    (dolist (x a)
+      (unless (member x b)
+        (push x result)))
+    (nreverse result)))
+
+(defun org-zot--write-synced-tags (tags)
+  "Write TAGS as #+ZOTERO_SYNCED_TAGS in the current buffer.
+TAGS is a list of unprefixed tag strings — the last-synced snapshot."
+  (let ((line (if tags
+                  (concat "#+ZOTERO_SYNCED_TAGS: "
+                          (mapconcat #'identity tags ", "))
+                "#+ZOTERO_SYNCED_TAGS:")))
+    (save-excursion
+      (goto-char (point-min))
+      (if (re-search-forward "^#\\+ZOTERO_SYNCED_TAGS:" nil t)
+          (let ((beg (line-beginning-position))
+                (end (line-end-position)))
+            (delete-region beg end)
+            (insert line))
+        (goto-char (point-min))
+        (when (re-search-forward "^#\\+\\(TITLE\\|AUTHOR\\|DATE\\|ZOTERO\\)" nil t)
+          (forward-line 1))
+        (insert (concat line "\n"))))))
+
+(defun org-zot--has-tag-source-p ()
+  "Return non-nil when the current buffer has a non-empty tag source.
+Looks for `#+FILETAGS:' or `#+ZOTERO_TAGS:' with an actual value."
+  (save-excursion
+    (goto-char (point-min))
+    (re-search-forward "^#\\+\\(?:FILETAGS\\|ZOTERO_TAGS\\):[ \t]*\\S-" nil t)))
+
+(defun org-zot--check-tags (tags)
+  "Warn about TAGS that are malformed for Zotero or for the snapshot.
+Returns TAGS unchanged; only emits diagnostics.  Catches the common
+`#+FILETAGS: a b' mistake (space-separated parses as ONE tag) and tags
+that already carry `org-zot-tag-prefix'."
+  (dolist (tag tags)
+    (cond
+     ((string-match-p "[ \t]" tag)
+      (message "⚠️  Tag %S contains whitespace — if from #+FILETAGS, use colon syntax `#+FILETAGS: :tag1:tag2:' (space-separated parses as one tag)." tag))
+     ((string-match-p "," tag)
+      (message "⚠️  Tag %S contains a comma — it will corrupt the #+ZOTERO_SYNCED_TAGS snapshot; rename it." tag))
+     ((and (not (null org-zot-tag-prefix))
+           (not (string-empty-p org-zot-tag-prefix))
+           (string-prefix-p org-zot-tag-prefix tag))
+      (message "⚠️  Tag %S already starts with prefix %S — store Org tags WITHOUT the prefix; it is added at sync time." tag org-zot-tag-prefix))))
+  tags)
+
+(defun org-zot--sync-tags (item-key tags synced-tags)
+  "Push tags newly added in Org to Zotero item ITEM-KEY.
+
+TAGS is the current Org tag list (from #+FILETAGS: or #+ZOTERO_TAGS:).
+SYNCED-TAGS is the last-synced snapshot (#+ZOTERO_SYNCED_TAGS:).
+
+Zotero is authoritative: only tags that appeared in Org since the last
+sync are pushed, via idempotent `zot tag add'.  Tags removed in Org are
+NOT removed from Zotero (delete there instead), and tags removed in
+Zotero are never resurrected.  System tags like /unread stay untouched.
+
+The snapshot only advances on success, so a failed `zot tag add' never
+records a false \"synced\" state that would block a later retry."
+  (let* ((new-tags (org-zot--set-difference tags synced-tags))
+         (prefixed (org-zot--prefix-tags new-tags)))
+    (cond
+     ;; No tags at all in this file → tell the user how to opt in.  When
+     ;; a source line exists but is empty, clear the snapshot; when the
+     ;; file has no tag source whatsoever, leave it alone entirely.
+     ((null tags)
+      (if (org-zot--has-tag-source-p)
+          (progn
+            (org-zot--write-synced-tags nil)
+            (message "🏷️  No tags in #+FILETAGS/#+ZOTERO_TAGS — cleared snapshot."))
+        (message "ℹ️  No #+FILETAGS or #+ZOTERO_TAGS in this file — nothing to sync.\n   Add e.g. `#+FILETAGS: :tag1:tag2:' to manage Zotero tags.")))
+     ;; New tags → push them, and only advance the snapshot on success.
+     (prefixed
+      (let ((tag-str (mapconcat #'identity prefixed ", ")))
+        (message "🏷️  Adding new tags: %s" tag-str)
+        (if (org-zot--call-zot-ok
+             (append (list "tag" "add" item-key) prefixed))
+            (progn
+              (org-zot--write-synced-tags tags)
+              (message "✅ Tags synced: %s" tag-str))
+          (message "⚠️ Tag sync failed for item: %s — snapshot NOT updated" item-key))))
+     (t
+      (org-zot--write-synced-tags tags)
+      (message "🏷️  No new tags to sync")))))
 
 (defun org-zot--parse-children (output)
   "Parse children from `zot.py attachment list' OUTPUT.
@@ -408,10 +506,23 @@ or a quoted string (note).  v2.0.0+ format with linkMode field is handled."
 Uses `zot attachment update' if an existing attachment child exists,
 otherwise falls back to `zot attachment add'.  Old notes are removed
 before `zot note set' creates a fresh one.
-Returns t on success, nil on failure."
+Returns t on success, nil on failure.  Signals `user-error' when the
+item cannot be listed at all (e.g. stale/deleted #+ZOTERO_ITEM_KEY)."
   (let* ((output (org-zot--call-zot-ok (list "attachment" "list" item-key)))
+         ;; `org-zot--call-zot-ok' returns nil only on real failure (non-zero
+         ;; exit or ❌ on stdout) — most commonly a stale #+ZOTERO_ITEM_KEY
+         ;; whose item was deleted (HTTP 404 "Item does not exist").  That is
+         ;; NOT the same as "no children": treating it as an empty parent would
+         ;; mask the 404 and attempt `attachment add' against a dead item,
+         ;; failing a second time with a confusing error.  Abort here instead,
+         ;; with recovery guidance, before any temp file is written.
          (children (if output (org-zot--parse-children output)
-                     (list :attachments nil :notes nil)))
+                     (user-error
+                      (concat "Zotero item %s is not found or not accessible "
+                              "(see zot.py error above).  If it was deleted, remove "
+                              "#+ZOTERO_ITEM_KEY and run `z z' again to create a "
+                              "new item — or replace it with the correct key.")
+                      item-key)))
          (att-entries (plist-get children :attachments))
          (note-entries (plist-get children :notes)))
     (message "🔍 Parsed children: %d attachment(s), %d note(s)"
@@ -555,7 +666,8 @@ attachments/notes and re-uploads."
                 (progn
                   (message "Updated: %s" item-key)
                   (org-zot--add-note item-key body-html)
-                  (org-zot--sync-tags item-key (plist-get metadata :tags)))
+                  (org-zot--sync-tags item-key (plist-get metadata :tags)
+                                      (plist-get metadata :synced-tags)))
               (user-error "Failed to upload attachment")))
         ;; Create: new item, write back key, upload
         (message "Creating Zotero item...")
@@ -566,6 +678,11 @@ attachments/notes and re-uploads."
                 (if (org-zot--attach-file new-key full-html attach-name)
                     (progn
                       (org-zot--write-item-key new-key)
+                      (let ((md-tags (plist-get metadata :tags)))
+                        (if md-tags
+                            (org-zot--write-synced-tags md-tags)
+                          (unless (org-zot--has-tag-source-p)
+                            (message "ℹ️  Item created without tags — add e.g. `#+FILETAGS: :tag1:tag2:' to tag it."))))
                       (org-zot--add-note new-key body-html)
                       (message "Exported to Zotero! Item: %s  Collection: %s"
                                new-key coll-key))
@@ -604,6 +721,7 @@ Requires #+ZOTERO_ITEM_KEY to be set."
   '((:zotero-item-type "ZOTERO_ITEM_TYPE" nil org-zot-default-item-type)
     (:zotero-collection "ZOTERO_COLLECTION" nil nil)
     (:zotero-tags "ZOTERO_TAGS" nil nil)
+    (:zotero-synced-tags "ZOTERO_SYNCED_TAGS" nil nil)
     (:zotero-url "ZOTERO_URL" nil nil)
     (:zotero-extra "ZOTERO_EXTRA" nil nil)
     (:zotero-item-key "ZOTERO_ITEM_KEY" nil nil)
