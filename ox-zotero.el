@@ -30,6 +30,7 @@
 ;;   - M-x org-export-dispatch, then press `z' prefix.
 ;;   - z b: Preview in buffer
 ;;   - z z: Create or update item + attachment + note
+;;   - z a: Create or update attachment only (skip note)
 ;;   - z o: Open item in Zotero
 ;;   - z k: Show item key
 ;;
@@ -69,12 +70,22 @@
 ;;                 (dvipng+base64) forcing to Zotero only; plain html and
 ;;                 ox-conf (Confluence) exports are no longer turned into
 ;;                 formula images.
+;;   - 2026-11-06: Added `z a' (attachment only).  Skips note creation and
+;;                 preserves existing child notes, avoiding the note-side
+;;                 compression/upload work that makes `z z' slow.
+;;   - 2026-11-06: Added batch LaTeX pre-rendering (`org-zot-batch-latex').
+;;                 Cache misses are collected during a throw-away export
+;;                 pass, then rendered in one multi-page latex run + one
+;;                 dvipng call per chunk instead of one process pair per
+;;                 formula.  ~235 formulas: 720s -> ~20s; output is
+;;                 byte-identical to `org-create-formula-image'.
 
 ;;; Code:
 
 (require 'ox)
 (require 'ox-html)
 (require 'json)
+(require 'cl-lib)
 
 ;;; ======================================================================
 ;;;                         Custom Variables
@@ -117,6 +128,21 @@ stale HTML issues in the export pipeline."
   :type 'boolean
   :group 'org-export-zotero)
 
+(defcustom org-zot-batch-latex t
+  "When non-nil, batch-render missing LaTeX formula images before export.
+Org's per-formula `org-create-formula-image' starts a fresh latex and
+dvipng process for every cache miss, which is very slow on Windows
+(several seconds per formula).  Batch rendering puts all missing
+formulas in one multi-page LaTeX document, compiles it once, and
+converts every page with one dvipng call.  Output is byte-identical to
+per-formula rendering (both use the same preamble/dpi), but for a few
+hundred formulas it drops a ~12 minute export to ~20 seconds.
+
+Only applies to the dvipng renderer.  If batch rendering fails, the
+export transparently falls back to the normal per-formula path."
+  :type 'boolean
+  :group 'org-export-zotero)
+
 ;;; ======================================================================
 ;;;                   Subprocess Bridge (zot.py)
 ;;; ======================================================================
@@ -139,15 +165,20 @@ Returns a cons cell: (exit-code . output-string)."
     (with-temp-buffer
       (when has-stdin
         (insert stdin-str))
-      (let ((exit-code
-             (apply #'call-process-region
-                    (point-min) (point-max)
-                    org-zot-python-command
-                    has-stdin
-                    (current-buffer)
-                    nil
-                    org-zot-script-path
-                    args)))
+      ;; Pin UTF-8 for both argv and stdin.  Without this, Windows
+      ;; `call-process-region' encodes command-line arguments in the
+      ;; console code page, so Chinese filenames (e.g. attachment names
+      ;; derived from #+TITLE) reach zot.py as spaces and lookups fail.
+      (let* ((coding-system-for-write 'utf-8-unix)
+             (exit-code
+              (apply #'call-process-region
+                     (point-min) (point-max)
+                     org-zot-python-command
+                     has-stdin
+                     (current-buffer)
+                     nil
+                     org-zot-script-path
+                     args)))
         (let ((output (buffer-string)))
           (if (= 0 exit-code)
               (let ((trimmed (string-trim output)))
@@ -331,8 +362,11 @@ Returns t on success, nil on failure."
          (tmpfile (expand-file-name fname tmpdir))
          (success nil))
     (make-directory (file-name-directory tmpfile) t)
-    (with-temp-file tmpfile
-      (insert html-content))
+    ;; HTML may contain non-ASCII text; pin UTF-8 so batch exports never
+    ;; block on `select-safe-coding-system'.
+    (let ((coding-system-for-write 'utf-8-unix))
+      (with-temp-file tmpfile
+        (insert html-content)))
     (message "📝 HTML saved to: %s" tmpfile)
     (unwind-protect
         (let ((args (if archive-filename
@@ -498,11 +532,17 @@ or a quoted string (note).  v2.0.0+ format with linkMode field is handled."
     (list :attachments (nreverse attachments)
           :notes (nreverse notes))))
 
-(defun org-zot--update-attachment (item-key html-content attach-name)
+(defun org-zot--update-attachment (item-key html-content attach-name
+                                            &optional keep-notes)
   "Upload or re-upload HTML-CONTENT as a file attachment to ITEM-KEY.
 Uses `zot attachment update' if an existing attachment child exists,
 otherwise falls back to `zot attachment add'.  Old notes are removed
 before `zot note set' creates a fresh one.
+
+When KEEP-NOTES is non-nil, existing child notes are left untouched and
+no note is expected to be recreated — used by the attachment-only export
+(`z a'), which must never delete notes it is not going to regenerate.
+
 Returns t on success, nil on failure.  Signals `user-error' when the
 item cannot be listed at all (e.g. stale/deleted #+ZOTERO_ITEM_KEY)."
   (let* ((output (org-zot--call-zot-ok (list "attachment" "list" item-key)))
@@ -528,18 +568,24 @@ item cannot be listed at all (e.g. stale/deleted #+ZOTERO_ITEM_KEY)."
          (fname (or attach-name "ox-zotero-export.html"))
          (tmpfile (expand-file-name fname tmpdir))
          (success nil))
-    ;; Write HTML to temp file
+    ;; Write HTML to temp file.  Pin UTF-8: the HTML contains non-ASCII
+    ;; text and batch exports cannot answer a coding-system prompt.
     (make-directory (file-name-directory tmpfile) t)
-    (with-temp-file tmpfile
-      (insert html-content))
+    (let ((coding-system-for-write 'utf-8-unix))
+      (with-temp-file tmpfile
+        (insert html-content)))
     (message "📝 HTML saved to: %s" tmpfile)
     (when org-zot-debug
       (message "🔬 DIAG-update: html-content md5=%s len=%d"
                (md5 html-content) (length html-content)))
-    ;; Remove old notes (note set will create a fresh one)
-    (dolist (entry note-entries)
-      (org-zot--call-zot-ok (list "attachment" "remove" (car entry)))
-      (message "🗑️  Detached old note: %s (%s)" (car entry) (cdr entry)))
+    ;; Remove old notes (note set will create a fresh one), unless the
+    ;; caller is an attachment-only export that will not recreate them.
+    (unless keep-notes
+      (dolist (entry note-entries)
+        (org-zot--call-zot-ok (list "attachment" "remove" (car entry)))
+        (message "🗑️  Detached old note: %s (%s)" (car entry) (cdr entry))))
+    (when keep-notes
+      (message "📝 Keeping %d existing note(s) untouched" (length note-entries)))
     (unwind-protect
         (cond
          ;; Existing attachment → reattach to first, detach extras
@@ -613,6 +659,206 @@ Returns FULL-HTML unchanged if no <body> tag found."
       full-html)))
 
 ;;; ======================================================================
+;;;                Batch LaTeX Image Pre-rendering
+;;; ======================================================================
+
+(defvar org-zot--collect-latex nil
+  "When non-nil, record `org-create-formula-image' calls instead of running.
+Bound dynamically around a throw-away export pass to collect the exact
+formulas and cache paths that would be rendered one by one.")
+
+(defvar org-zot--pending-latex nil
+  "List of (STRING TOFILE OPTIONS) collected during a prewarm pass.")
+
+(defun org-zot--capture-formula-image
+    (orig string tofile options buffer &optional processing-type)
+  "Around-advice for `org-create-formula-image'.
+While `org-zot--collect-latex' is non-nil, this is an export (not a
+preview), and the renderer is dvipng, record the call instead of
+rendering.  Everything else goes through ORIG unchanged."
+  (if (and org-zot--collect-latex
+           (null buffer)
+           (eq (or processing-type org-preview-latex-default-process)
+               'dvipng))
+      (progn
+        (push (list string tofile options) org-zot--pending-latex)
+        nil)
+    (funcall orig string tofile options buffer processing-type)))
+
+(advice-add 'org-create-formula-image :around
+            #'org-zot--capture-formula-image)
+
+(defun org-zot--latex-preamble ()
+  "Return the LaTeX preamble `org-create-formula-image' would use."
+  (or (plist-get (alist-get 'dvipng org-preview-latex-process-alist)
+                 :latex-header)
+      (org-latex-make-preamble
+       (org-export-get-environment (org-export-get-backend 'latex))
+       org-format-latex-header 'snippet)))
+
+(defun org-zot--latex-color-rgb (color)
+  "Return COLOR formatted for \\definecolor, or nil when unusable."
+  (cond
+   ((null color) nil)
+   ((eq color 'default) nil)          ; needs face lookup -> fall back
+   ((and (stringp color) (string= color "Transparent")) nil)
+   ((stringp color) (org-latex-color-format color))
+   (t nil)))
+
+(defun org-zot--batch-render-latex-chunk (entries)
+  "Render ENTRIES in one multi-page LaTeX document.
+Each entry is (STRING TOFILE OPTIONS).  Compiles once with latex, then
+converts every page with one dvipng invocation and copies the pages to
+their TOFILE cache paths.  Return non-nil on success."
+  (let* ((tmpdir (make-temp-file "ox-zot-latex-" t))
+         (texfile (expand-file-name "batch.tex" tmpdir))
+         (dvifile (expand-file-name "batch.dvi" tmpdir))
+         (pagepat (expand-file-name "page%d.png" tmpdir))
+         (options (nth 2 (car entries)))
+         (fg (or (plist-get options :html-foreground) "Black"))
+         (bg (or (plist-get options :html-background) "Transparent"))
+         (fg-rgb (org-zot--latex-color-rgb fg))
+         (bg-rgb (org-zot--latex-color-rgb bg))
+         (transparent (and (stringp bg) (string= bg "Transparent")))
+         (dpi (* (or (plist-get options :html-scale) 1.0) 140.0))
+         (ok nil))
+    (if (or (null fg-rgb)
+            (and (not transparent) (null bg-rgb)))
+        nil                             ; unsupported colors -> fallback
+      (unwind-protect
+          (condition-case err
+              (progn
+                ;; Formulas may contain non-ASCII (e.g. Chinese) text;
+                ;; without this, write-region may prompt for a coding
+                ;; system, which fails in batch (EOF on stdin).
+                (let ((coding-system-for-write 'utf-8-unix))
+                  (with-temp-file texfile
+                    (insert (org-zot--latex-preamble))
+                    (insert "\n\\begin{document}\n")
+                    (insert (format "\\definecolor{fg}{rgb}{%s}%%\n" fg-rgb))
+                    (when bg-rgb
+                      (insert (format "\\definecolor{bg}{rgb}{%s}%%\n"
+                                      bg-rgb))
+                      (insert "\n\\pagecolor{bg}%\n"))
+                    (cl-loop for (string _tofile _opts) in entries
+                             for i from 0
+                             do (insert "\n{\\color{fg}\n")
+                             (let ((s (copy-sequence string)))
+                               (if (string-suffix-p "\n" s)
+                                   (aset s (1- (length s)) ?%)
+                                 (setq s (concat s "%")))
+                               (insert s))
+                             (insert "\n}\n")
+                             (unless (= i (1- (length entries)))
+                               (insert "\\newpage\n")))
+                    (insert "\n\\end{document}\n")))
+                ;; LaTeX exits non-zero on non-fatal errors while still
+                ;; producing a usable DVI (this is common with snippets),
+                ;; so judge success by the output, not the status.
+                (let ((status (call-process
+                               "latex" nil nil nil
+                               "-interaction" "nonstopmode"
+                               "-output-directory" tmpdir texfile)))
+                  (unless (file-exists-p dvifile)
+                    (error "latex produced no DVI (status %S)" status)))
+                (let ((args (append (list "-D" (format "%s" dpi) "-T" "tight")
+                                    (when transparent
+                                      (list "-bg" "Transparent"))
+                                    (list "-o" pagepat dvifile))))
+                  (apply #'call-process "dvipng" nil nil nil args)
+                  (unless (directory-files tmpdir nil "\\`page[0-9]+\\.png\\'")
+                    (error "dvipng produced no pages")))
+                (let ((pages
+                       (sort
+                        (delq nil
+                              (mapcar
+                               (lambda (f)
+                                 (when (string-match
+                                        "\\`page\\([0-9]+\\)\\.png\\'" f)
+                                   (cons (string-to-number
+                                          (match-string 1 f))
+                                         f)))
+                               (directory-files tmpdir)))
+                        (lambda (a b) (< (car a) (car b))))))
+                  (unless (= (length pages) (length entries))
+                    (error "page count mismatch: %d rendered, %d expected"
+                           (length pages) (length entries)))
+                  (cl-loop for (_string tofile _opts) in entries
+                           for (_num . page) in pages
+                           do (let ((dir (file-name-directory tofile)))
+                                (when dir (make-directory dir t))
+                                (copy-file (expand-file-name page tmpdir)
+                                           tofile t)))
+                  (setq ok t)))
+            (error
+             (let ((log (expand-file-name "batch.log" tmpdir)))
+               (message "⚠️ Batch LaTeX chunk failed (%s)%s"
+                        (error-message-string err)
+                        (if (file-exists-p log)
+                            (with-temp-buffer
+                              (insert-file-contents log)
+                              (goto-char (point-min))
+                              (let (lines)
+                                (while (re-search-forward "^!.*$" nil t)
+                                  (push (match-string-no-properties 0) lines))
+                                (if lines
+                                    (concat "\n"
+                                            (mapconcat #'identity
+                                                       (last (nreverse lines) 5)
+                                                       "\n"))
+                                  "")))
+                          "")))))
+        (delete-directory tmpdir t))
+      ok)))
+
+(defun org-zot--prewarm-latex (entries &optional chunk-size)
+  "Render ENTRIES, batching CHUNK-SIZE formulas per LaTeX run.
+Falls back to per-formula rendering for any chunk that fails.
+Returns the number of images processed."
+  (let ((chunk-size (or chunk-size 60))
+        (total 0))
+    (while entries
+      (let* ((n (min chunk-size (length entries)))
+             (chunk (cl-subseq entries 0 n)))
+        (setq entries (nthcdr n entries))
+        (if (org-zot--batch-render-latex-chunk chunk)
+            (message "⚡ Batch-rendered %d LaTeX image(s)" n)
+          (message "⚠️ Falling back to %d individual LaTeX render(s)..." n)
+          (dolist (entry chunk)
+            (org-create-formula-image
+             (nth 0 entry) (nth 1 entry) (nth 2 entry) nil 'dvipng)))
+        (setq total (+ total n))))
+    total))
+
+(defun org-zot--export-as (subtreep visible-only ext-plist)
+  "Export with `org-zot-html', batching missing LaTeX images first.
+The first pass records cache misses instead of rendering them; if any
+are found, they are batch-rendered and the export is repeated.  A warm
+cache costs nothing extra (one export pass, no formula calls)."
+  (if (not org-zot-batch-latex)
+      (org-export-as 'org-zot-html subtreep visible-only nil ext-plist)
+    (let* ((org-zot--collect-latex t)
+           (org-zot--pending-latex nil)
+           (html (org-export-as 'org-zot-html subtreep visible-only nil
+                                ext-plist)))
+      (if (null org-zot--pending-latex)
+          html
+        (let ((seen (make-hash-table :test #'equal))
+              (unique nil))
+          (dolist (entry (nreverse org-zot--pending-latex))
+            (unless (gethash (nth 1 entry) seen)
+              (puthash (nth 1 entry) t seen)
+              (push entry unique)))
+          (setq unique (nreverse unique))
+          (message "⚡ %d missing LaTeX image(s); batch-rendering..."
+                   (length unique))
+          (let ((org-zot--collect-latex nil))
+            (org-zot--prewarm-latex unique)
+            (message "✅ LaTeX prewarm done; re-exporting HTML...")
+            (org-export-as 'org-zot-html subtreep visible-only nil
+                           ext-plist)))))))
+
+;;; ======================================================================
 ;;;                     Export Entry Points
 ;;; ======================================================================
 
@@ -625,13 +871,14 @@ The HTML shown is what would be sent as a Zotero note."
     async subtreep visible-only body-only ext-plist
     (lambda () (html-mode))))
 
-(defun org-zot-export-to-zotero
-    (&optional async subtreep visible-only body-only ext-plist)
-  "Export org article to Zotero — create or update.
-If no #+ZOTERO_ITEM_KEY exists, creates a new item and writes the key
-back to the buffer.  If the key already exists, cleans up old
-attachments/notes and re-uploads."
-  (interactive)
+(defun org-zot--export-to-zotero-core (skip-note subtreep visible-only ext-plist)
+  "Export org article to Zotero — shared orchestration for `z z' and `z a'.
+When SKIP-NOTE is non-nil, only the file attachment is written: existing
+child notes are left untouched and no `zot note set' call is made.  That
+skips zot.py's note-side image compression/size fitting, which re-encodes
+every embedded formula PNG against the note size budget.  The HTML export
+itself still runs (the attachment needs the same standalone HTML), and
+item creation, key write-back, and tag sync run in both modes."
   (let* ((info-plist (org-combine-plists
                       ext-plist
                       (org-export--get-inbuffer-options 'org-zot-html)))
@@ -647,24 +894,33 @@ attachments/notes and re-uploads."
     (unless (and coll-key (not (string-empty-p coll-key)))
       (user-error "No collection specified. Set #+ZOTERO_COLLECTION or org-zot-default-collection-key"))
 
-    (let* ((full-html (org-export-as 'org-zot-html subtreep visible-only nil ext-plist))
-           (body-html (org-zot--extract-body full-html)))
+    (let* ((full-html (org-zot--export-as subtreep visible-only ext-plist))
+           (body-html (unless skip-note (org-zot--extract-body full-html))))
       (unless (and full-html (not (string-empty-p (string-trim full-html))))
         (user-error "Export produced empty output"))
       (when org-zot-debug
-      (message "🔬 DIAG-export: body md5=%s len=%d first-150=%s"
-               (md5 body-html) (length body-html)
-               (substring body-html 0 (min 150 (length body-html)))))
+        (message "🔬 DIAG-export: skip-note=%s body md5=%s len=%s first-150=%s"
+                 skip-note
+                 (if body-html (md5 body-html) "n/a")
+                 (if body-html (length body-html) "n/a")
+                 (if body-html
+                     (substring body-html 0 (min 150 (length body-html)))
+                   "n/a")))
       (if item-key
-          ;; Update: replace attachment in-place, update note, sync tags
+          ;; Update: replace attachment in-place; note only when not skipped
           (progn
-            (message "Uploading to item: %s" item-key)
-            (if (org-zot--update-attachment item-key full-html attach-name)
+            (message "%s item: %s"
+                     (if skip-note "Updating attachment only on" "Uploading to")
+                     item-key)
+            (if (org-zot--update-attachment item-key full-html attach-name skip-note)
                 (progn
-                  (message "Updated: %s" item-key)
-                  (org-zot--add-note item-key body-html)
+                  (unless skip-note
+                    (message "Updated: %s" item-key)
+                    (org-zot--add-note item-key body-html))
                   (org-zot--sync-tags item-key (plist-get metadata :tags)
-                                      (plist-get metadata :synced-tags)))
+                                      (plist-get metadata :synced-tags))
+                  (when skip-note
+                    (message "✅ Attachment updated — note skipped: %s" item-key)))
               (user-error "Failed to upload attachment")))
         ;; Create: new item, write back key, upload
         (message "Creating Zotero item...")
@@ -680,11 +936,33 @@ attachments/notes and re-uploads."
                             (org-zot--write-synced-tags md-tags)
                           (unless (org-zot--has-tag-source-p)
                             (message "ℹ️  Item created without tags — add e.g. `#+FILETAGS: :tag1:tag2:' to tag it."))))
-                      (org-zot--add-note new-key body-html)
-                      (message "Exported to Zotero! Item: %s  Collection: %s"
-                               new-key coll-key))
+                      (if skip-note
+                          (message "✅ Exported attachment only (no note)! Item: %s  Collection: %s"
+                                   new-key coll-key)
+                        (org-zot--add-note new-key body-html)
+                        (message "Exported to Zotero! Item: %s  Collection: %s"
+                                 new-key coll-key)))
                   (user-error "Item created (%s) but attachment upload failed" new-key)))
             (user-error "Failed to create Zotero item")))))))
+
+(defun org-zot-export-to-zotero
+    (&optional async subtreep visible-only body-only ext-plist)
+  "Export org article to Zotero — create or update item + attachment + note.
+If no #+ZOTERO_ITEM_KEY exists, creates a new item and writes the key
+back to the buffer.  If the key already exists, cleans up old
+attachments/notes and re-uploads."
+  (interactive)
+  (org-zot--export-to-zotero-core nil subtreep visible-only ext-plist))
+
+(defun org-zot-export-to-zotero-attachment-only
+    (&optional async subtreep visible-only body-only ext-plist)
+  "Export org article to Zotero — attachment only, no note.
+Same item creation/update and tag sync as `org-zot-export-to-zotero',
+but never creates, updates, or deletes the child note.  Use this when
+the note's per-formula LaTeX PNG handling is too slow and only the HTML
+attachment is needed.  Bound to `z a' in the Zotero export menu."
+  (interactive)
+  (org-zot--export-to-zotero-core t subtreep visible-only ext-plist))
 
 (defun org-zot-open-in-zotero
     (&optional async subtreep visible-only body-only ext-plist)
@@ -727,7 +1005,8 @@ Requires #+ZOTERO_ITEM_KEY to be set."
   :menu-entry
   '(?z "Export to Zotero"
        ((?b "Preview in buffer" org-zot-export-to-buffer)
-        (?z "Create or update" org-zot-export-to-zotero)
+        (?z "Create or update (item + attachment + note)" org-zot-export-to-zotero)
+        (?a "Attachment only (skip note)" org-zot-export-to-zotero-attachment-only)
         (?o "Open in Zotero" org-zot-open-in-zotero)
         (?k "Show item key" org-zot-show-item-key))))
 
