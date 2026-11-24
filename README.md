@@ -99,7 +99,8 @@ export ZOTERO_WEBDAV_PASS="your-webdav-pass"
 | 按键 | 功能 | 说明 |
 |------|------|------|
 | `z b` | 预览 | 在 `*Zotero HTML Export*` buffer 中预览 |
-| `z z` | 创建或更新 | 无 key 则创建 + 写回，有 key 则更新 |
+| `z z` | 创建或更新 | 无 key 则创建 + 写回，有 key 则更新（item + 附件 + note） |
+| `z a` | 仅附件 | 与 `z z` 相同的 item/附件/tag 流程，但**跳过 note**；已有 note 原样保留 |
 | `z o` | 打开 | 在 Zotero 桌面端打开当前条目 |
 | `z k` | 显示 key | 在 minibuffer 显示当前 item key |
 
@@ -114,6 +115,36 @@ export ZOTERO_WEBDAV_PASS="your-webdav-pass"
 5. 上传 HTML 附件（文件名取自 `#+ZOTERO_ATTACH_NAME:` 或 `#+TITLE:`）
 6. 写入 body-only HTML 作为 child note
 7. 同步 tags：Zotero 为权威，只把 Org 相对上次新增的 tag 推上去（`zot tag add`）；删除在 Zotero 做，Org 删 tag 不回删、Zotero 删 tag 不复活
+
+### `z a`（仅附件，跳过 note）
+
+`z z` 的轻量版：item 创建/更新、附件上传、key 写回、tag 同步全部照旧，唯一区别是**不调用 `zot note set`**。
+
+- **更新路径**：已有 child note **不会被删除**（`z z` 会先删除旧 note 再重建，`z a` 不做这一步）
+- **创建路径**：新建 item 只上传附件，不创建 note
+- 适用场景：note 里公式多时 hook 每次保存都要做 note 体积压缩，太慢；只要 HTML 附件时用 `z a`
+
+### LaTeX 公式缓存（Org 自带）
+
+公式图片不需要额外缓存层——导出走的是 Org 原生机制：
+
+- `org-html-format-latex` → `org-format-latex` 对每个公式计算 SHA1（公式内容 + `org-format-latex-header` + packages + `org-format-latex-options` + 前景/背景色）
+- 缓存文件：`<org 文件目录>/_assets/ltximg/<org 文件名>_<sha1>.png`（目录由 `org-preview-latex-image-directory` 控制）
+- 命中时跳过 `org-create-formula-image`，不再启动 latex/dvipng
+
+`org-zot-html` 派生自 `html`，与普通 ox-html 共享**同一套缓存文件和 hash**。因此重复导出只有新公式会慢，已有公式直接复用；`z z` / `z a` 都不需要重新渲染。
+
+### 批量渲染缓存缺失的公式（`org-zot-batch-latex`）
+
+缓存命中时零开销；命中不了时，逐条 `org-create-formula-image` 会为每个公式各启动一次 latex + dvipng（Windows 上约 3-4 秒/条，200+ 公式要十几分钟）。
+
+开启 `org-zot-batch-latex`（默认 t）后：
+
+1. 第一次导出把缓存缺失的公式**只记录不渲染**（秒级）
+2. 按 60 条一组，把所有公式写进一个多页 LaTeX 文档，`latex` 编译一次、`dvipng -o page%d.png` 一次出全部页面
+3. 页面按 SHA1 重命名到 Org 的缓存路径，再重新导出一次（此时全部命中）
+
+实测 235 个唯一公式：**720s → 约 18s**（latex 7.6s + dvipng 10.2s）。批量和逐条输出**逐字节一致**（同一 preamble、dpi=140、`-T tight`）。某一组编译失败时，该组自动回退到逐条渲染。
 
 ### 错误处理
 
@@ -162,7 +193,7 @@ ox-zotero.el
   ├── Item 创建、附件原地更新、Note 写入
   ├── HTML 工具（org-zot--extract-body 提取 body 给 note）
   ├── Item Key 写回
-  ├── 导出入口（z b / z z / z o / z k）
+  ├── 导出入口（z b / z z / z a / z o / z k）
   └── Backend Definition（纯选项 + 菜单，无覆盖，无 filter）
 ```
 
